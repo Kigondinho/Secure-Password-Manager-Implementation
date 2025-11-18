@@ -10,44 +10,21 @@ const Buffer = require('buffer').Buffer;
 
 const PBKDF2_ITERATIONS = 100000;
 const MAX_PASSWORD_LENGTH = 64;   
-const PBKDF2_SALT_LENGTH = 16;    
+const PBKDF2_SALT_LENGTH = 16;
 const AES_GCM_IV_LENGTH = 12;     
 const MAC_KEY_INFO = stringToBuffer("MAC_KEY_DERIVATION"); 
 const ENC_KEY_INFO = stringToBuffer("AES_KEY_DERIVATION"); 
+// NEW CONSTANT: Fixed data used to generate the authentication tag
+const AUTH_TAG_INFO = stringToBuffer("AUTH_TAG_VERIFICATION_DATA");
 
 /********* Helper Functions ********/
 
 /**
- * Derives a sub-key from the master key k using HMAC-SHA256 as a PRF.
+ * Executes only the PBKDF2 step to derive the master key (k).
  */
-async function deriveSubKey(masterKey, info, keyUsages, algorithmName) {
-    const rawKeyBuffer = await subtle.sign("HMAC", masterKey, info);
-    
-    // Define the required algorithm parameters, including 'hash' for HMAC
-    let algorithmParams;
-    if (algorithmName === "HMAC") {
-        // FIX: HmacImportParams requires the 'hash' property
-        algorithmParams = { name: "HMAC", hash: "SHA-256", length: 256 };
-    } else { // AES-GCM case
-        algorithmParams = { name: algorithmName, length: 256 };
-    }
-
-    return await subtle.importKey(
-        "raw",
-        rawKeyBuffer,
-        algorithmParams, 
-        false, 
-        keyUsages
-    );
-}
-
-/**
- * Encapsulates PBKDF2 and subsequent sub-key derivation. (O(1) time complexity)
- */
-async function deriveKeys(password, saltBuffer) {
+async function deriveMasterKey(password, saltBuffer) {
     const passwordBuffer = stringToBuffer(password);
     
-    // 1. Import raw password key for PBKDF2
     const rawKey = await subtle.importKey(
       "raw", 
       passwordBuffer, 
@@ -63,18 +40,44 @@ async function deriveKeys(password, saltBuffer) {
         hash: "SHA-256" 
     };
 
-    // 2. Derive Master Key (k). The deriveKey call for HMAC *must* specify the hash.
-    const masterKeyK = await subtle.deriveKey(
+    // Derive Master Key (k). This key is usable for HMAC (needed for derivation/auth tag).
+    return await subtle.deriveKey(
         pbkdf2Params, rawKey, 
         { name: "HMAC", hash: "SHA-256", length: 256 }, 
-        true, 
+        true, // Must be extractable/usable for sub-key derivation
         ["sign", "verify"]
     );
+}
+
+
+/**
+ * Derives a sub-key from the master key k using HMAC-SHA256 as a PRF.
+ */
+async function deriveSubKey(masterKey, info, keyUsages, algorithmName) {
+    const rawKeyBuffer = await subtle.sign("HMAC", masterKey, info);
     
-    // 3. Derive Sub-Keys (HMAC as PRF) using the corrected helper
+    let algorithmParams;
+    if (algorithmName === "HMAC") {
+        algorithmParams = { name: "HMAC", hash: "SHA-256", length: 256 };
+    } else { // AES-GCM case
+        algorithmParams = { name: algorithmName, length: 256 };
+    }
+
+    return await subtle.importKey(
+        "raw",
+        rawKeyBuffer,
+        algorithmParams, 
+        false, 
+        keyUsages
+    );
+}
+
+/**
+ * Derives kMAC and kENC subkeys.
+ */
+async function deriveSubKeys(masterKeyK) {
     const kMAC = await deriveSubKey(masterKeyK, MAC_KEY_INFO, ["sign", "verify"], "HMAC");
     const kENC = await deriveSubKey(masterKeyK, ENC_KEY_INFO, ["encrypt", "decrypt"], "AES-GCM");
-
     return { kMAC, kENC };
 }
 
@@ -118,9 +121,10 @@ function unpadValue(paddedBuffer) {
 /********* Implementation ********/
 class Keychain {
   
-  constructor(saltBase64, kMAC, kENC) {
+  constructor(saltBase64, authTagBase64, kMAC, kENC) {
     this.data = {
       salt: saltBase64, 
+      authTag: authTagBase64, // NEW: Authentication Tag for load verification
       kvs: {} 
     };
     this.secrets = {
@@ -135,9 +139,17 @@ class Keychain {
     const salt = getRandomBytes(PBKDF2_SALT_LENGTH);
     const saltBase64 = encodeBuffer(salt);
     
-    const { kMAC, kENC } = await deriveKeys(password, salt);
+    // 1. Derive Master Key (k)
+    const masterKeyK = await deriveMasterKey(password, salt);
+    
+    // 2. Derive Sub-Keys (kMAC, kENC)
+    const { kMAC, kENC } = await deriveSubKeys(masterKeyK);
 
-    return new Keychain(saltBase64, kMAC, kENC);
+    // 3. Derive Authentication Tag T = HMAC(k, "AUTH_TAG_VERIFICATION_DATA")
+    const authTagBuffer = await subtle.sign("HMAC", masterKeyK, AUTH_TAG_INFO);
+    const authTagBase64 = encodeBuffer(authTagBuffer);
+
+    return new Keychain(saltBase64, authTagBase64, kMAC, kENC);
   }
     
   /**
@@ -152,20 +164,37 @@ class Keychain {
         throw new Error("Invalid keychain representation format."); 
     }
     
-    // 2. Password Authentication & Key Derivation (O(1) time)
+    // 2. Password Authentication (O(1) time)
     const saltBase64 = loadedData.salt;
     const saltBuffer = decodeBuffer(saltBase64);
+    const storedAuthTagBase64 = loadedData.authTag; // Retrieve stored tag
 
-    let kMAC, kENC;
+    let masterKeyK;
     try {
-        // Derive keys using the provided password and stored salt
-        ({ kMAC, kENC } = await deriveKeys(password, saltBuffer));
+        // Derive Master Key (k) using the user's password and stored salt
+        masterKeyK = await deriveMasterKey(password, saltBuffer);
+        
+        // Calculate verification tag T' = HMAC(k', "AUTH_TAG_VERIFICATION_DATA")
+        const computedAuthTagBuffer = await subtle.sign("HMAC", masterKeyK, AUTH_TAG_INFO);
+        const computedAuthTagBase64 = encodeBuffer(computedAuthTagBuffer);
+        
+        // **AUTHENTICATION CHECK**: Compare T' with stored T. This is the fix for the test.
+        if (computedAuthTagBase64 !== storedAuthTagBase64) { 
+             throw new Error("Invalid password provided. Password verification failed."); 
+        }
     } catch (e) {
-        // Explicitly throw "Invalid password" if key derivation fails or produces garbage keys
+        // Catch exceptions from PBKDF2 or the explicit tag mismatch check above
+        if (e.message.includes("Invalid password")) {
+             throw e; // Re-throw the explicit password error
+        }
+        // Handle generic/other crypto errors as authentication failures
         throw new Error("Invalid password provided. Password verification failed."); 
     }
 
-    // 3. Rollback Attack Defense (Integrity Check) (O(n) time)
+    // 3. Derive Sub-Keys (kMAC, kENC) using the authenticated master key
+    const { kMAC, kENC } = await deriveSubKeys(masterKeyK);
+
+    // 4. Rollback Attack Defense (Integrity Check) (O(n) time)
     if (trustedDataCheck !== undefined) {
       const reprBuffer = stringToBuffer(repr);
       const computedHashBuffer = await subtle.digest("SHA-256", reprBuffer);
@@ -176,8 +205,8 @@ class Keychain {
       }
     }
     
-    // 4. Instantiate and Return
-    const keychain = new Keychain(saltBase64, kMAC, kENC);
+    // 5. Instantiate and Return
+    const keychain = new Keychain(saltBase64, storedAuthTagBase64, kMAC, kENC);
     keychain.data.kvs = loadedData.kvs; 
     
     return keychain;
