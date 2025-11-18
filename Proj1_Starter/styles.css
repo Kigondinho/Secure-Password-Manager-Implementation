@@ -1,0 +1,26 @@
+/* Basic styling for demonstration */
+body {
+    font-family: sans-serif;
+    max-width: 800px;
+    margin: auto;
+}
+
+.view {
+    border: 1px solid #ccc;
+    padding: 20px;
+    margin-top: 20px;
+}
+
+/* Message styling */
+.error {
+    color: red;
+}
+
+.success {
+    color: green; /* Added to clearly distinguish success messages */
+}
+
+/* Initial state for the unlocked view (Replaces inline style="display:none;") */
+#unlocked-view {
+    display: none;
+}
